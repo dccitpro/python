@@ -1,0 +1,499 @@
+import os
+import re
+import json
+import email
+from email.header import decode_header
+import sqlite3
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from tkhtmlview import HTMLLabel
+
+CONFIG_FILE = "viewer_settings.json"
+
+
+def decode_str(header_value):
+    """Utility to decode MIME encoded headers into readable text."""
+    if not header_value:
+        return "(No Information)"
+    try:
+        decoded_list = decode_header(header_value)
+        header_text = ""
+        for content, encoding in decoded_list:
+            if isinstance(content, bytes):
+                try:
+                    header_text += content.decode(encoding if encoding else "utf-8", errors="ignore")
+                except Exception:
+                    header_text += content.decode("latin1", errors="ignore")
+            else:
+                header_text += str(content)
+        return header_text
+    except Exception:
+        return str(header_value)
+
+
+class FastMboxViewerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("54GB Stream Email Archive Viewer — David Cabagay")
+        self.root.geometry("1100x750")
+
+        self.mbox_path = None
+        self.db_path = None
+        self.conn = None
+        self.page = 0
+        self.page_size = 500
+        self.current_msg = None
+        self.view_mode_html = True
+
+        # Top Control Bar
+        top_frame = ttk.Frame(self.root, padding=10)
+        top_frame.pack(fill=tk.X)
+
+        self.btn_open = ttk.Button(top_frame, text="Select .MBOX File", command=self.select_mbox)
+        self.btn_open.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_index = ttk.Button(top_frame, text="Build Index (Required for 54GB)", command=self.start_indexing, state=tk.DISABLED)
+        self.btn_index.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.lbl_status = ttk.Label(top_frame, text="No file selected.", font=("Arial", 9, "italic"))
+        self.lbl_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Search Bar & Pagination Frame
+        search_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        search_frame.pack(fill=tk.X)
+
+        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 5))
+        self.entry_search = ttk.Entry(search_frame)
+        self.entry_search.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.entry_search.bind("<Return>", lambda e: self.reset_and_load())
+
+        btn_search = ttk.Button(search_frame, text="Search DB", command=self.reset_and_load)
+        btn_search.pack(side=tk.LEFT, padx=(0, 15))
+
+        # Page Controls
+        self.btn_prev = ttk.Button(search_frame, text="< Prev 500", command=self.prev_page, state=tk.DISABLED)
+        self.btn_prev.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.lbl_page = ttk.Label(search_frame, text="Page 1", font=("Arial", 9, "bold"))
+        self.lbl_page.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_next = ttk.Button(search_frame, text="Next 500 >", command=self.next_page, state=tk.DISABLED)
+        self.btn_next.pack(side=tk.LEFT)
+
+        # Paned Window
+        paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # Email List (Treeview)
+        list_frame = ttk.Frame(paned)
+        columns = ("id", "sender", "subject", "date")
+        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
+
+        self.tree.heading("id", text="ID")
+        self.tree.heading("sender", text="Sender")
+        self.tree.heading("subject", text="Subject")
+        self.tree.heading("date", text="Date")
+
+        self.tree.column("id", width=60, anchor=tk.CENTER)
+        self.tree.column("sender", width=250, anchor=tk.W)
+        self.tree.column("subject", width=500, anchor=tk.W)
+        self.tree.column("date", width=200, anchor=tk.W)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=scrollbar.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_email_select)
+        paned.add(list_frame, weight=1)
+
+        # Content Area Container
+        content_frame = ttk.Frame(paned)
+        paned.add(content_frame, weight=2)
+
+        # Content Header Bar (Toggle View Mode & Attachments)
+        self.bar_frame = ttk.Frame(content_frame, padding=2)
+        self.bar_frame.pack(fill=tk.X, side=tk.TOP)
+
+        self.btn_toggle_view = ttk.Button(self.bar_frame, text="Switch to Plain Text View", command=self.toggle_view_mode)
+        self.btn_toggle_view.pack(side=tk.RIGHT, padx=5)
+
+        self.attachment_frame = ttk.LabelFrame(content_frame, text="Attachments", padding=5)
+        self.attachment_frame.pack(fill=tk.X, side=tk.TOP, padx=5, pady=2)
+        self.attachment_frame.pack_forget()
+
+        # Dual Viewer: HTML Label vs Plain Text Box
+        self.viewer_container = ttk.Frame(content_frame)
+        self.viewer_container.pack(fill=tk.BOTH, expand=True)
+
+        self.html_body = HTMLLabel(self.viewer_container, html="<h3 style='color: gray;'>Select an email to view content...</h3>")
+        self.html_body.pack(fill=tk.BOTH, expand=True)
+
+        self.text_body = tk.Text(self.viewer_container, wrap=tk.WORD, font=("Consolas", 10))
+        self.text_scroll = ttk.Scrollbar(self.text_body, orient=tk.VERTICAL, command=self.text_body.yview)
+        self.text_body.configure(yscrollcommand=self.text_scroll.set)
+
+        # Automatically check for previously saved path on startup
+        self.load_remembered_mbox()
+
+    def save_last_path(self, path):
+        """Saves current MBOX path to local JSON settings."""
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({"last_mbox_path": path}, f)
+        except Exception:
+            pass
+
+    def load_remembered_mbox(self):
+        """Attempts to auto-load last opened MBOX file from settings."""
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    data = json.load(f)
+                    last_path = data.get("last_mbox_path")
+                    if last_path and os.path.exists(last_path):
+                        self.load_mbox_by_path(last_path)
+            except Exception:
+                pass
+
+    def select_mbox(self):
+        file_path = filedialog.askopenfilename(
+            title="Select 54GB MBOX File",
+            filetypes=[("MBOX Files", "*.mbox"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        self.load_mbox_by_path(file_path)
+
+    def load_mbox_by_path(self, file_path):
+        """Sets up MBOX and SQLite database references."""
+        self.mbox_path = file_path
+        self.db_path = file_path + ".db"
+        self.save_last_path(file_path)
+
+        if os.path.exists(self.db_path):
+            self.lbl_status.config(text=f"Loaded: {os.path.basename(self.mbox_path)}")
+            self.btn_index.config(state=tk.DISABLED)
+            self.connect_db()
+            self.reset_and_load()
+        else:
+            self.lbl_status.config(text=f"Loaded: {os.path.basename(self.mbox_path)} (Index needed)")
+            self.btn_index.config(state=tk.NORMAL)
+
+    def connect_db(self):
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
+    def start_indexing(self):
+        self.btn_open.config(state=tk.DISABLED)
+        self.btn_index.config(state=tk.DISABLED)
+        self.lbl_status.config(text="Indexing 54GB file in background... This may take several minutes.")
+        threading.Thread(target=self.bg_build_index, daemon=True).start()
+
+    def bg_build_index(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS emails (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    byte_offset INTEGER,
+                    sender TEXT,
+                    subject TEXT,
+                    date TEXT
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_search ON emails(sender, subject)")
+            cursor.execute("DELETE FROM emails")
+            conn.commit()
+
+            file_size = os.path.getsize(self.mbox_path)
+            batch = []
+            
+            with open(self.mbox_path, "rb") as f:
+                offset = 0
+                current_msg_offset = None
+                headers_raw = []
+                in_header = False
+
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+
+                    if line.startswith(b"From "):
+                        if current_msg_offset is not None:
+                            msg_bytes = b"".join(headers_raw)
+                            msg = email.message_from_bytes(msg_bytes)
+                            sender = decode_str(msg.get("From", "Unknown"))
+                            subject = decode_str(msg.get("Subject", "(No Subject)"))
+                            date = decode_str(msg.get("Date", ""))
+                            batch.append((current_msg_offset, sender, subject, date))
+
+                        current_msg_offset = offset
+                        headers_raw = []
+                        in_header = True
+
+                        if len(batch) >= 1000:
+                            cursor.executemany("INSERT INTO emails (byte_offset, sender, subject, date) VALUES (?, ?, ?, ?)", batch)
+                            conn.commit()
+                            batch = []
+                            pct = int((offset / file_size) * 100)
+                            self.root.after(0, self.update_index_status, f"Indexing... {pct}% complete")
+
+                    elif in_header:
+                        if line in (b"\r\n", b"\n"):
+                            in_header = False
+                        else:
+                            headers_raw.append(line)
+
+                    offset = f.tell()
+
+                if current_msg_offset is not None and headers_raw:
+                    msg = email.message_from_bytes(b"".join(headers_raw))
+                    batch.append((
+                        current_msg_offset,
+                        decode_str(msg.get("From", "Unknown")),
+                        decode_str(msg.get("Subject", "(No Subject)")),
+                        decode_str(msg.get("Date", ""))
+                    ))
+                if batch:
+                    cursor.executemany("INSERT INTO emails (byte_offset, sender, subject, date) VALUES (?, ?, ?, ?)", batch)
+                    conn.commit()
+
+            conn.close()
+            self.root.after(0, self.on_index_complete)
+
+        except Exception as e:
+            self.root.after(0, self.on_index_error, str(e))
+
+    def update_index_status(self, text):
+        self.lbl_status.config(text=text)
+
+    def on_index_complete(self):
+        self.btn_open.config(state=tk.NORMAL)
+        self.lbl_status.config(text=f"Loaded: {os.path.basename(self.mbox_path)}")
+        self.connect_db()
+        self.reset_and_load()
+
+    def on_index_error(self, err_msg):
+        self.btn_open.config(state=tk.NORMAL)
+        self.btn_index.config(state=tk.NORMAL)
+        messagebox.showerror("Indexing Error", f"Failed to index file:\n{err_msg}")
+
+    def reset_and_load(self):
+        self.page = 0
+        self.load_table()
+
+    def prev_page(self):
+        if self.page > 0:
+            self.page -= 1
+            self.load_table()
+
+    def next_page(self):
+        self.page += 1
+        self.load_table()
+
+    def load_table(self):
+        if not self.conn:
+            return
+
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        query = self.entry_search.get().strip()
+        cursor = self.conn.cursor()
+        offset = self.page * self.page_size
+
+        if query:
+            sql = "SELECT id, sender, subject, date FROM emails WHERE sender LIKE ? OR subject LIKE ? LIMIT ? OFFSET ?"
+            cursor.execute(sql, (f"%{query}%", f"%{query}%", self.page_size, offset))
+        else:
+            sql = "SELECT id, sender, subject, date FROM emails LIMIT ? OFFSET ?"
+            cursor.execute(sql, (self.page_size, offset))
+
+        rows = cursor.fetchall()
+        for r in rows:
+            self.tree.insert("", tk.END, values=r)
+
+        self.lbl_page.config(text=f"Page {self.page + 1}")
+        self.btn_prev.config(state=tk.NORMAL if self.page > 0 else tk.DISABLED)
+        self.btn_next.config(state=tk.NORMAL if len(rows) == self.page_size else tk.DISABLED)
+
+        cursor.execute("SELECT COUNT(*) FROM emails")
+        total_count = cursor.fetchone()[0]
+        self.lbl_status.config(text=f"Displaying emails {offset + 1} - {offset + len(rows)} of {total_count} total.")
+
+    def on_email_select(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        email_id = self.tree.item(selected[0])["values"][0]
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT byte_offset FROM emails WHERE id = ?", (email_id,))
+        start_offset = cursor.fetchone()[0]
+
+        cursor.execute("SELECT byte_offset FROM emails WHERE id > ? ORDER BY id ASC LIMIT 1", (email_id,))
+        next_row = cursor.fetchone()
+        end_offset = next_row[0] if next_row else None
+
+        with open(self.mbox_path, "rb") as f:
+            f.seek(start_offset)
+            if end_offset:
+                raw_msg = f.read(end_offset - start_offset)
+            else:
+                raw_msg = f.read()
+
+            self.current_msg = email.message_from_bytes(raw_msg)
+
+        self.render_attachments_ui(self.current_msg)
+        self.update_viewer_display()
+
+    def render_attachments_ui(self, msg):
+        for widget in self.attachment_frame.winfo_children():
+            widget.destroy()
+
+        attachments = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_disp = str(part.get("Content-Disposition"))
+                filename = part.get_filename()
+
+                if filename or "attachment" in content_disp:
+                    decoded_filename = decode_str(filename) if filename else "unnamed_attachment"
+                    attachments.append((decoded_filename, part))
+
+        if attachments:
+            self.attachment_frame.pack(fill=tk.X, side=tk.TOP, padx=5, pady=2)
+            for filename, part in attachments:
+                btn = ttk.Button(
+                    self.attachment_frame,
+                    text=f"📎 Save {filename}",
+                    command=lambda p=part, fn=filename: self.save_attachment(p, fn)
+                )
+                btn.pack(side=tk.LEFT, padx=5, pady=2)
+        else:
+            self.attachment_frame.pack_forget()
+
+    def save_attachment(self, part, filename):
+        file_path = filedialog.asksaveasfilename(
+            initialfile=filename,
+            title="Save Attachment"
+        )
+        if file_path:
+            payload = part.get_payload(decode=True)
+            if payload:
+                with open(file_path, "wb") as f:
+                    f.write(payload)
+                messagebox.showinfo("Success", f"Saved: {os.path.basename(file_path)}")
+
+    def toggle_view_mode(self):
+        self.view_mode_html = not self.view_mode_html
+        if self.view_mode_html:
+            self.btn_toggle_view.config(text="Switch to Plain Text View")
+            self.text_body.pack_forget()
+            self.text_scroll.pack_forget()
+            self.html_body.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.btn_toggle_view.config(text="Switch to HTML View")
+            self.html_body.pack_forget()
+            self.text_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        if self.current_msg:
+            self.update_viewer_display()
+
+    def update_viewer_display(self):
+        if not self.current_msg:
+            return
+
+        sender = decode_str(self.current_msg.get('From'))
+        to_addr = decode_str(self.current_msg.get('To'))
+        subject = decode_str(self.current_msg.get('Subject'))
+        date = decode_str(self.current_msg.get('Date'))
+
+        if self.view_mode_html:
+            html_content = self.extract_html_or_plain(self.current_msg)
+            cleaned_html = re.sub(r'<style.*?>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+
+            header_info = f"""
+            <div style="background-color: #f1f1f1; padding: 10px; border-bottom: 2px solid #ccc; font-family: sans-serif;">
+                <b>From:</b> {sender}<br>
+                <b>To:</b> {to_addr}<br>
+                <b>Subject:</b> {subject}<br>
+                <b>Date:</b> {date}<br>
+            </div>
+            <div style="padding: 10px; font-family: sans-serif;">
+                {cleaned_html}
+            </div>
+            """
+            self.html_body.set_html(header_info)
+        else:
+            plain_text = self.extract_plain_text(self.current_msg)
+            header_str = f"From: {sender}\nTo: {to_addr}\nSubject: {subject}\nDate: {date}\n" + ("-" * 60) + "\n\n"
+            
+            self.text_body.delete("1.0", tk.END)
+            self.text_body.insert(tk.END, header_str + plain_text)
+
+    def extract_html_or_plain(self, msg):
+        html_body = ""
+        plain_body = ""
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disp = str(part.get("Content-Disposition"))
+
+                if content_type == "text/html" and "attachment" not in content_disp:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        html_body = payload.decode(charset, errors="ignore")
+                        break
+                elif content_type == "text/plain" and "attachment" not in content_disp:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        plain_body = payload.decode(charset, errors="ignore")
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                if msg.get_content_type() == "text/html":
+                    html_body = payload.decode(charset, errors="ignore")
+                else:
+                    plain_body = payload.decode(charset, errors="ignore")
+
+        if html_body:
+            return html_body
+        elif plain_body:
+            return plain_body.replace("\n", "<br>")
+        else:
+            return "<i>(No readable content found)</i>"
+
+    def extract_plain_text(self, msg):
+        plain_body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition")):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        plain_body += payload.decode(charset, errors="ignore") + "\n"
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                plain_body = payload.decode(charset, errors="ignore")
+
+        return plain_body if plain_body else "(No plain text payload found)"
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FastMboxViewerApp(root)
+    root.mainloop()
